@@ -24,7 +24,6 @@ class HardwareManager:
             self.target = cw.target(self.scope, cw.targets.SimpleSerial2)
             self.scope.default_setup()
 
-            # 5000 samples captures the first AES round on the Nano perfectly
             self.scope.adc.samples = 5000
             self.is_connected = True
             return True

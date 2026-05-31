@@ -195,18 +195,20 @@ class AnalysisWorker(QThread):
 
 class AutoSniperWorker(QThread):
     progress_signal = pyqtSignal(int, int, str)
-    finished_signal = pyqtSignal(list, list)
+    # FIX: Added a 4th object to pass back the best correlation weights
+    finished_signal = pyqtSignal(list, list, object, object)
 
-    def __init__(self, traces, textins, base_dsp, true_keys=None):
+    def __init__(self, traces, textins, base_dsp, sniper_config, true_keys=None):
         super().__init__()
         self.traces = traces
         self.textins = textins
         self.base_dsp = base_dsp
+        self.sniper_config = sniper_config
         self.true_keys = true_keys
 
     def run(self):
-        # We need the unified pipeline to execute the filter combinations
-        from core.analysis import apply_dsp_pipeline
+        import itertools
+        from core.analysis import apply_dsp_pipeline, analyze_byte, LEAKAGE_MODELS
         
         model_name = self.base_dsp.get('leakage_model', "AES-128 S-Box Output (Round 1)")
         leakage_model_class = next((m for m in LEAKAGE_MODELS if m.name == model_name), AES128_SBox_Out)
@@ -214,55 +216,51 @@ class AutoSniperWorker(QThread):
         
         recovered_key = [0] * num_targets
         best_pges = [255] * num_targets
+        
+        probability_matrix = np.zeros((num_targets, 256), dtype=np.uint8)
+        # FIX: Create a matrix to store the max correlations for the beam search scoring
+        best_corrs = np.zeros((num_targets, 256), dtype=np.float64) 
+        
+        best_metrics = [float('inf')] * num_targets 
 
-        # THE SNIPER GRID: The combinations of filters to test per-byte
-        prom_values = [0.05, 0.08, 0.10, 0.12, 0.15]
-        sigma_values = [None, 1.0, 1.5, 2.0]
-        probability_matrix = np.zeros((16, 12), dtype=np.uint8)
-        for b in range(num_targets):
-            found_zero = False
-            best_pge = 255
-            best_guess = 0
-            t_key_byte = int(self.true_keys[b] if self.true_keys.ndim == 1 else self.true_keys[0, b])
+        keys_cfg, values_cfg = zip(*self.sniper_config.items())
+        combinations = [dict(zip(keys_cfg, v)) for v in itertools.product(*values_cfg)]
+        total_combos = len(combinations)
 
-            for prom in prom_values:
-                for sigma in sigma_values:
-                    self.progress_signal.emit(b, num_targets, f"Byte {b}: Testing Prom={prom}, Sigma={sigma}")
+        for i, combo in enumerate(combinations):
+            combo_str = ", ".join([f"{k}={v}" for k, v in combo.items() if len(self.sniper_config[k]) > 1])
+            if not combo_str: combo_str = "Fixed Baseline parameters"
+            
+            self.progress_signal.emit(0, num_targets, f"Evaluating Config ({i+1}/{total_combos}): [ {combo_str} ]")
+            
+            test_dsp = self.base_dsp.copy()
+            test_dsp.update(combo)
+            if test_dsp.get('fft_end') == 0: test_dsp['fft_end'] = None
+            
+            working_traces = apply_dsp_pipeline(self.traces, test_dsp)
+            
+            for b in range(num_targets):
+                _, guess, byte_corr = analyze_byte(b, working_traces, self.textins[:, b], leakage_model_class)
+                
+                max_corr_per_guess = np.max(byte_corr, axis=1)
+                sorted_guesses = np.argsort(max_corr_per_guess)[::-1]
+                
+                if self.true_keys is not None:
+                    t_key = int(self.true_keys[b] if self.true_keys.ndim == 1 else self.true_keys[0, b])
+                    metric = int(np.where(sorted_guesses == t_key)[0][0])
+                else:
+                    metric = -float(max_corr_per_guess[sorted_guesses[0]])
+
+                if metric < best_metrics[b]:
+                    best_metrics[b] = metric
+                    recovered_key[b] = sorted_guesses[0]
+                    best_pges[b] = metric if self.true_keys is not None else 0
                     
-                    # 1. Modify the DSP settings for this specific test
-                    test_dsp = self.base_dsp.copy()
-                    test_dsp['slice_prom'] = prom
-                    if sigma is None:
-                        test_dsp['gauss_enabled'] = False
-                    else:
-                        test_dsp['gauss_enabled'] = True
-                        test_dsp['gauss_sigma'] = sigma
-
-                    # 2. Run the modified pipeline
-                    working_traces = apply_dsp_pipeline(self.traces, test_dsp)
+                    probability_matrix[b] = sorted_guesses
+                    # FIX: Save the raw correlation scores for the beam search
+                    best_corrs[b] = max_corr_per_guess 
                     
-                    # 3. Analyze ONLY the current target byte
-                    _, guess, byte_corr = analyze_byte(b, working_traces, self.textins[:, b], leakage_model_class)
-                    pge = compute_pge(byte_corr, t_key_byte)
-                    
-                    # Keep track of the best result in case we never hit 0
-                    if pge < best_pge:
-                        best_pge = pge
-                        best_guess = guess
+                    self.progress_signal.emit(b + 1, num_targets, f"Byte {b} Improved: Best Guess {recovered_key[b]:02x}")
 
-                    # 4. If we cracked it perfectly, abort the loop and move to next byte!
-                    if pge == 0:
-                        found_zero = True
-                        break
-                        
-                if found_zero:
-                    break
-
-            # Lock in the best result for this byte
-            recovered_key[b] = best_guess
-            best_pges[b] = best_pge
-            self.progress_signal.emit(b + 1, num_targets, f"Locked Byte {b}: {best_guess:02x} (PGE {best_pge})")
-            byte_corr_top12 = np.argsort(byte_corr)[-12:][::-1] 
-            probability_matrix[b] = byte_corr_top12
-
-        self.finished_signal.emit(recovered_key, best_pges)
+        # FIX: Emit best_corrs alongside the probability matrix
+        self.finished_signal.emit(recovered_key, best_pges, probability_matrix, best_corrs)
