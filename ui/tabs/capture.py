@@ -436,6 +436,10 @@ class CaptureTab(QWidget):
             device_serial = "unknown"
             if self.hw.is_connected and hasattr(self.hw.scope, 'sn'):
                 device_serial = self.hw.scope.sn
+            try:
+                adc_hz = self.hw.scope.clock.adc_freq if self.hw.is_connected else 20000000
+            except AttributeError:
+                adc_hz = 20000000
 
             metadata = {
                 "device_serial": device_serial,
@@ -443,6 +447,7 @@ class CaptureTab(QWidget):
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "num_traces": len(traces),
                 "num_samples": self.spin_samples.value(),            # <-- CHANGED: Uses your spin box value
+                "sample_rate_hz": adc_hz,
                 "key_hex": key_hex_str,
                 "random_key": self.chk_random_key.isChecked(),       # <-- CHANGED: Uses checkbox state
                 "random_plaintext": self.chk_random_plaintext.isChecked(), # <-- CHANGED: Uses checkbox state

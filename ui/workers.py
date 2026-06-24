@@ -139,25 +139,23 @@ class CaptureWorker(QThread):
             self.log_signal.emit(f"ERROR: Capture failed - {str(e)}")
             self.finished_signal.emit(False, None, None, None)
 
-
 class AnalysisWorker(QThread):
     progress_signal = pyqtSignal(int, int)      
     finished_signal = pyqtSignal(list, object, list, object)  
 
-    def __init__(self, traces, textins, dsp_settings, num_threads=None, true_keys=None):
+    # FIX 1: Add 'ciphers' to the arguments
+    def __init__(self, traces, textins, ciphers, dsp_settings, num_threads=None, true_keys=None):
         super().__init__()
         self.traces = traces
         self.textins = textins
+        self.ciphers = ciphers       # <-- NEW
         self.dsp = dsp_settings
         self.num_threads = num_threads
         self.true_keys = true_keys
 
     def run(self):
-        # 1. Pipeline Execution
-        # This guarantees the Worker uses the EXACT same math as the UI Preview
         working_traces = apply_dsp_pipeline(self.traces, self.dsp)
 
-        # 2. Dynamic Multi-Cipher Leakage Engagement
         model_name = self.dsp.get('leakage_model', "AES-128 S-Box Output (Round 1)")
         leakage_model_class = next((m for m in LEAKAGE_MODELS if m.name == model_name), AES128_SBox_Out)
         
@@ -171,9 +169,14 @@ class AnalysisWorker(QThread):
         tvla_matrix = np.zeros((num_targets, num_samples), dtype=np.float64)
         completed = 0
         
+        # FIX 2: Dynamically route Data based on the model name
+        use_ciphers = "Ciphertext" in model_name
+        target_data = self.ciphers if (use_ciphers and self.ciphers is not None) else self.textins
+        
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.num_threads) as executor:
             futures = {
-                executor.submit(analyze_byte, b, working_traces, self.textins[:, b], leakage_model_class): b 
+                # FIX 3: Pass target_data instead of self.textins
+                executor.submit(analyze_byte, b, working_traces, target_data[:, b], leakage_model_class): b 
                 for b in range(num_targets)
             }
             
@@ -185,7 +188,8 @@ class AnalysisWorker(QThread):
                 if self.true_keys is not None:
                     t_key_byte = int(self.true_keys[bnum] if self.true_keys.ndim == 1 else self.true_keys[0, bnum])
                     pge_list[bnum] = compute_pge(byte_corr, t_key_byte)
-                    tvla_matrix[bnum] = compute_tvla(working_traces, self.textins[:, bnum], t_key_byte, leakage_model_class)
+                    # FIX 4: Update TVLA to also use the correct target_data
+                    tvla_matrix[bnum] = compute_tvla(working_traces, target_data[:, bnum], t_key_byte, leakage_model_class)
                 
                 completed += 1
                 self.progress_signal.emit(completed, num_targets)
@@ -198,10 +202,11 @@ class AutoSniperWorker(QThread):
     # FIX: Added a 4th object to pass back the best correlation weights
     finished_signal = pyqtSignal(list, list, object, object)
 
-    def __init__(self, traces, textins, base_dsp, sniper_config, true_keys=None):
+    def __init__(self, traces, textins, ciphers, base_dsp, sniper_config, true_keys=None):
         super().__init__()
         self.traces = traces
         self.textins = textins
+        self.ciphers = ciphers     # <-- NEW
         self.base_dsp = base_dsp
         self.sniper_config = sniper_config
         self.true_keys = true_keys
@@ -226,7 +231,8 @@ class AutoSniperWorker(QThread):
         keys_cfg, values_cfg = zip(*self.sniper_config.items())
         combinations = [dict(zip(keys_cfg, v)) for v in itertools.product(*values_cfg)]
         total_combos = len(combinations)
-
+        use_ciphers = "Ciphertext" in model_name
+        target_data = self.ciphers if (use_ciphers and self.ciphers is not None) else self.textins
         for i, combo in enumerate(combinations):
             combo_str = ", ".join([f"{k}={v}" for k, v in combo.items() if len(self.sniper_config[k]) > 1])
             if not combo_str: combo_str = "Fixed Baseline parameters"
@@ -240,7 +246,7 @@ class AutoSniperWorker(QThread):
             working_traces = apply_dsp_pipeline(self.traces, test_dsp)
             
             for b in range(num_targets):
-                _, guess, byte_corr = analyze_byte(b, working_traces, self.textins[:, b], leakage_model_class)
+                _, guess, byte_corr = analyze_byte(b, working_traces, target_data[:, b], leakage_model_class)
                 
                 max_corr_per_guess = np.max(byte_corr, axis=1)
                 sorted_guesses = np.argsort(max_corr_per_guess)[::-1]

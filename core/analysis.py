@@ -621,40 +621,85 @@ def apply_poc_alignment(traces, window_start=0, window_end=500):
     num_traces, num_samples = traces.shape
     if window_end is None or window_end > num_samples: window_end = num_samples
     aligned = np.empty_like(traces)
-    window = np.hanning(window_end - window_start)
     
-    # FIX: Subtract mean before windowing to kill the DC bias
+    L = window_end - window_start
+    window = np.hanning(L)
+    
     raw_ref = np.mean(traces[:min(10, num_traces)], axis=0)[window_start:window_end]
     ref = (raw_ref - np.mean(raw_ref)) * window
-    F = np.fft.fft(ref)
+    
+    # FIX: Pad to 2*L - 1 to force Linear Convolution instead of Circular
+    pad_len = 2 * L - 1
+    F = np.fft.fft(ref, n=pad_len)
     
     for i in range(num_traces):
         raw_targ = traces[i, window_start:window_end]
-        targ = (raw_targ - np.mean(raw_targ)) * window  # FIX applied here too
-        G = np.fft.fft(targ)
+        targ = (raw_targ - np.mean(raw_targ)) * window
+        G = np.fft.fft(targ, n=pad_len)
         
         R = F * np.conj(G)
         R /= (np.abs(R) + 1e-12) 
-        r = np.fft.ifft(R)
-        shift = np.argmax(np.abs(r))
-        if shift > len(ref) // 2: shift -= len(ref)
+        r = np.real(np.fft.ifft(R)) # Real part is sufficient for cross-corr
         
-        aligned[i] = shift_trace_safe(traces[i], shift) 
+        shift = np.argmax(r)
+        
+        # Adjust for the padding offset
+        if shift >= L: 
+            shift -= pad_len
+            
+        # FIX: Shift MUST be inverted to pull the target back to the reference
+        aligned[i] = shift_trace_safe(traces[i], -shift) 
     return aligned
+
+# def apply_peak_alignment(traces, window_start=0, window_end=500):
+#     num_traces, num_samples = traces.shape
+#     aligned_traces = np.empty_like(traces)
+#     reference_trace = traces[0]
+#     ref_window = reference_trace[window_start:window_end]
+#     aligned_traces[0] = reference_trace
+    
+#     for i in range(1, num_traces):
+#         target_window = traces[i, window_start:window_end]
+#         correlation = np.correlate(target_window, ref_window, mode='same')
+#         best_offset = np.argmax(correlation) - (len(ref_window) // 2)
+#         # BUG FIX: Safe Shift
+#         aligned_traces[i] = shift_trace_safe(traces[i], -best_offset)
+#     return aligned_traces
+
 
 def apply_peak_alignment(traces, window_start=0, window_end=500):
     num_traces, num_samples = traces.shape
     aligned_traces = np.empty_like(traces)
-    reference_trace = traces[0]
-    ref_window = reference_trace[window_start:window_end]
-    aligned_traces[0] = reference_trace
     
+    # 1. Use EXACTLY Trace 0 as the absolute reference (Never mean-average desynchronized traces)
+    reference_trace = traces[0]
+
+    # Validate window
+    if window_end <= window_start: window_end = window_start + 1
+    ref_window = reference_trace[window_start:window_end]
+
+    aligned_traces[0] = reference_trace
+
     for i in range(1, num_traces):
-        target_window = traces[i, window_start:window_end]
-        correlation = np.correlate(target_window, ref_window, mode='same')
-        best_offset = np.argmax(correlation) - (len(ref_window) // 2)
-        # BUG FIX: Safe Shift
-        aligned_traces[i] = shift_trace_safe(traces[i], -best_offset)
+        # 2. Expand search area massively to catch the 3200-cycle drift
+        search_start = max(0, window_start - 4000)
+        search_end = min(num_samples, window_end + 4000)
+        search_window = traces[i, search_start:search_end]
+
+        if len(search_window) < len(ref_window):
+            aligned_traces[i] = traces[i]
+            continue
+
+        # 3. 'valid' mode slides the smaller template completely inside the massive search window
+        correlation = np.correlate(search_window, ref_window, mode='valid')
+        best_idx = np.argmax(correlation)
+
+        # 4. Calculate exactly how many samples the trace drifted from Trace 0
+        offset = (search_start + best_idx) - window_start
+
+        # 5. Pull the trace perfectly back into alignment
+        aligned_traces[i] = shift_trace_safe(traces[i], -offset)
+
     return aligned_traces
 
 
@@ -667,8 +712,13 @@ def apply_segment_alignment(traces, num_segments=8, max_warp=20):
     seg_size = num_samples // num_segments
 
     if seg_size <= max_warp:
-        # BUG FIX: Do not return silently. Fallback to standard cross-correlation.
-        return apply_peak_alignment(traces, 0, num_samples)
+        # FIX: If segments are too small, fallback to Peak Alignment 
+        # but artificially bound it so it doesn't violate max_warp constraints.
+        print("Segments too small. Falling back to bounded peak alignment.")
+        # Restrict the trace window so peak alignment can only search within max_warp bounds
+        start_bound = max(0, (num_samples // 2) - max_warp * 2)
+        end_bound = min(num_samples, (num_samples // 2) + max_warp * 2)
+        return apply_peak_alignment(traces, start_bound, end_bound)
 
     for i in range(1, num_traces):
         reconstructed = []
@@ -711,10 +761,9 @@ def apply_segment_alignment(traces, num_segments=8, max_warp=20):
     return aligned_traces
 
 
-def apply_dtw_alignment(traces, window_start=0, window_end=500, warp_radius=5):
+def apply_dtw_alignment(traces, window_start=0, window_end=500, warp_radius=20):
     try:
         from fastdtw import fastdtw
-        import concurrent.futures
     except ImportError:
         print("fastdtw module missing. Skipping DTW Alignment.")
         return traces
@@ -724,39 +773,45 @@ def apply_dtw_alignment(traces, window_start=0, window_end=500, warp_radius=5):
     ref = traces[0, window_start:window_end]
     aligned_traces[0] = traces[0]
 
+    # DTW Distance metric
     scalar_dist = lambda x, y: abs(x - y)
 
-    def process_trace(i):
+    for i in range(1, num_traces):
         targ = traces[i, window_start:window_end]
+        
+        # Calculate warp path
         _, path = fastdtw(ref, targ, radius=warp_radius, dist=scalar_dist)
 
-        # BUG FIX: Force float64 to prevent uint8 accumulator overflow
         warp_trace = np.zeros(num_samples, dtype=np.float64)
-        counts = np.zeros(num_samples, dtype=np.float64)
+        mapped = set()
 
+        # Nearest-neighbor mapping to preserve voltage variance (critical for CPA)
         for px, py in path:
             abs_px = window_start + px
             abs_py = window_start + py
+            
             if abs_px < num_samples and abs_py < num_samples:
-                warp_trace[abs_px] += traces[i][abs_py]
-                counts[abs_px] += 1
+                if abs_px not in mapped:
+                    warp_trace[abs_px] = traces[i][abs_py]
+                    mapped.add(abs_px)
 
-        counts[counts == 0] = 1
-        result_trace = warp_trace / counts
-        result_trace[:window_start] = traces[i, :window_start]
+        # Interpolate empty gaps to prevent zero-dropouts (dead zones)
+        mask = warp_trace == 0
+        if np.any(mask):
+            valid_idx = np.where(~mask)[0]
+            if len(valid_idx) > 0:
+                warp_trace[mask] = np.interp(np.where(mask)[0], valid_idx, warp_trace[valid_idx])
+
+        # Stitch the unaligned edges back onto the aligned window
+        warp_trace[:window_start] = traces[i, :window_start]
         if window_end < num_samples:
-            result_trace[window_end:] = traces[i, window_end:]
+            warp_trace[window_end:] = traces[i, window_end:]
 
-        return i, result_trace.astype(traces.dtype)
+        aligned_traces[i] = warp_trace.astype(traces.dtype)
 
-    import os
-
-    workers = min(4, os.cpu_count() or 1)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {executor.submit(process_trace, i): i for i in range(1, num_traces)}
-        for future in concurrent.futures.as_completed(futures):
-            idx, res = future.result()
-            aligned_traces[idx] = res
+        # Optional: Print progress so the user doesn't think the tool froze
+        if i % 100 == 0:
+            print(f"DTW Aligned {i}/{num_traces} traces...")
 
     return aligned_traces
 
@@ -842,8 +897,9 @@ def apply_peak_slicing(
 
 
 def apply_bandpass_filter(traces, lowcut=1_000_000, highcut=10_000_000, fs=20_000_000):
-    if highcut >= (fs / 2): highcut = (fs / 2) - 1000
-    # BUG FIX: Prevent bounds collision crash
+    nyquist = fs / 2.0
+    # Strict bound limits for Scipy
+    if highcut >= nyquist: highcut = nyquist - 1000
     if lowcut >= highcut: lowcut = highcut - 1000
     if lowcut <= 0: lowcut = 100 
     
@@ -896,7 +952,11 @@ def apply_fft_magnitude(traces, start_sample=0, end_sample=None, cutoff_bin=None
     mean_removed = windowed_traces - np.mean(windowed_traces, axis=1, keepdims=True)
     hanning_window = np.hanning(mean_removed.shape[1])
     windowed_signals = mean_removed * hanning_window
-    fft_data = np.abs(np.fft.rfft(windowed_signals, axis=1))[:, 1:]
+    fft_data = np.abs(np.fft.rfft(windowed_signals, axis=1))
+    # Keep DC removal but account for it in cutoff interpretation:
+    if cutoff_bin is not None and cutoff_bin > 0:
+        cutoff_bin = min(cutoff_bin + 1, fft_data.shape[1])  # compensate for the [:, 1:] shift
+    fft_data = fft_data[:, 1:]  # remove DC after bounds calculation
     
     # BUG FIX: Respect the 0 value for dynamic unbounded processing
     if cutoff_bin is None or cutoff_bin == 0:
@@ -927,6 +987,7 @@ def apply_pca_filtering(traces, n_components=5, drop_pc0=False):
 
 def shift_trace_safe(trace, shift_val):
     """Mathematically safe trace shifting without edge-wrapping."""
+    shift_val = int(np.clip(shift_val, -(len(trace) - 1), len(trace) - 1))
     shifted = np.empty_like(trace)
     if shift_val > 0:
         shifted[shift_val:] = trace[:-shift_val]
@@ -1069,18 +1130,8 @@ def apply_dsp_pipeline(traces, dsp, full_traces=None):
         )
 
     # =====================================================================
-    # 2. AMPLITUDE DEMODULATION (Masking Defeats)
-    # Rule: Apply to cleaned traces, but before alignment.
-    # =====================================================================
-    masking_mode = dsp.get("masking_mode", "None")
-    if masking_mode == "Absolute Value Centering":
-        working_traces = np.abs(working_traces - np.mean(working_traces, axis=0))
-    elif masking_mode == "Trace Squaring":
-        working_traces = np.power(working_traces - np.mean(working_traces, axis=0), 2)
-
-    # =====================================================================
-    # 3. TIME-DOMAIN STRUCTURAL ALIGNMENTS
-    # Rule: Cross-correlation works best when DC drift is already removed.
+    # 2. TIME-DOMAIN STRUCTURAL ALIGNMENTS
+    # Rule: Cross-correlation MUST happen on signed, raw voltage phases.
     # =====================================================================
     align_mode = dsp.get("align_mode", "None")
     if align_mode == "Peak Cross-Correlation":
@@ -1100,6 +1151,16 @@ def apply_dsp_pipeline(traces, dsp, full_traces=None):
         working_traces = apply_segment_alignment(
             working_traces, dsp.get("elastic_segs", 8), dsp.get("elastic_warp", 20)
         )
+
+    # =====================================================================
+    # 3. AMPLITUDE DEMODULATION (Masking Defeats)
+    # Rule: Apply ONLY after signals are structurally aligned.
+    # =====================================================================
+    masking_mode = dsp.get("masking_mode", "None")
+    if masking_mode == "Absolute Value Centering":
+        working_traces = np.abs(working_traces - np.mean(working_traces, axis=0))
+    elif masking_mode == "Trace Squaring":
+        working_traces = np.power(working_traces - np.mean(working_traces, axis=0), 2)
 
     # =====================================================================
     # 4. JITTER DEFEATS / POOLING (Hardware Async-Clock Absorption)

@@ -56,7 +56,7 @@ class SweepParameterWidget(QWidget):
         self.param_type = config["type"]
         self.layout = QHBoxLayout(self)
         self.layout.setContentsMargins(0, 0, 0, 0)
-
+        self.true_sample_rate = 20_000_000
         self.chk_sweep = QCheckBox(f"Sweep {label_text}")
         self.chk_sweep.stateChanged.connect(self.toggle_sweep)
         self.layout.addWidget(self.chk_sweep)
@@ -992,7 +992,7 @@ class CrackTab(QWidget):
             "bandpass_enabled": self.chk_bp.isChecked(),
             "bp_low": self.spin_bplow.value(),
             "bp_high": self.spin_bphigh.value(),
-            "bp_fs": 20_000_000,
+            "bp_fs": getattr(self, "true_sample_rate", 20_000_000),
             "wavelet_enabled": self.chk_wavelet.isChecked(),
             "wavelet_type": self.combo_wavelet.currentText(),
             "wavelet_level": self.spin_wlevel.value(),
@@ -1047,12 +1047,11 @@ class CrackTab(QWidget):
             return
 
         run_path = Path(selected_dir)
-        file_traces, file_textins, file_keys, file_ciphers = (
-            run_path / "traces.npy",
-            run_path / "plaintexts.npy",
-            run_path / "key.npy",
-            run_path / "ciphertexts.npy",  # <-- Added target path
-        )
+        file_traces = run_path / "traces.npy"
+        file_textins = run_path / "plaintexts.npy"
+        file_keys = run_path / "key.npy"
+        file_ciphers = run_path / "ciphertexts.npy"
+        file_meta = run_path / "metadata.json"  # <-- ADD THIS
 
         # FIX: Backward compatibility check (allow loading older runs without ciphers)
         if not (file_traces.exists() and file_textins.exists() and file_keys.exists()):
@@ -1076,7 +1075,13 @@ class CrackTab(QWidget):
             else:
                 self.ciphers = None
                 has_ciphers_str = " (No Ciphertexts found)"
-
+            if file_meta.exists():
+                import json
+                with open(file_meta, "r") as f:
+                    meta = json.load(f)
+                    self.true_sample_rate = meta.get("sample_rate_hz", 20_000_000)
+            else:
+                self.true_sample_rate = 20_000_000
             num_traces, _ = self.traces.shape
             self.btn_crack.setEnabled(True)
             self.btn_sniper.setEnabled(True)
@@ -1104,7 +1109,7 @@ class CrackTab(QWidget):
         threads = self.spin_threads.value()
 
         self.worker = AnalysisWorker(
-            self.traces, self.textins, dsp_settings, threads, true_keys=self.keys
+            self.traces, self.textins, self.ciphers, dsp_settings, threads, true_keys=self.keys
         )
         self.worker.progress_signal.connect(self.update_progress)
         self.worker.finished_signal.connect(self.on_cpa_finished)
@@ -1220,7 +1225,7 @@ class CrackTab(QWidget):
 
         # 2. Pass the dynamic config to the Worker
         self.sniper_worker = AutoSniperWorker(
-            self.traces, self.textins, base_dsp, sniper_config, true_keys=self.keys
+            self.traces, self.textins, self.ciphers, base_dsp, sniper_config, true_keys=self.keys
         )
         self.sniper_worker.progress_signal.connect(self.update_sniper_progress)
         self.sniper_worker.finished_signal.connect(self.on_sniper_finished)
@@ -1293,8 +1298,16 @@ class CrackTab(QWidget):
         target_ciphertext = bytes(self.ciphers[0])
 
         self.lbl_key.setText("Executing dynamic PGE-bounded Beam Search...")
+        avg_pge = np.mean(self.pge_list)
+        worst_pge = np.max(self.pge_list)
+        beam_width = 5000 if worst_pge < 10 else 25000 
         
-        beam_width = 5000 
+        if worst_pge > 50:
+            QMessageBox.warning(
+                self, 
+                "High PGE Warning", 
+                f"Byte {np.argmax(self.pge_list)} has a PGE of {worst_pge}. The beam search might prune the correct key due to extreme noise. Proceeding with expanded beam width."
+            )
         active_beam = [(0.0, [])]
 
         for b in range(16):
