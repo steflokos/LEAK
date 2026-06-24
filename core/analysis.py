@@ -1168,13 +1168,13 @@ def apply_dsp_pipeline(traces, dsp, full_traces=None):
     # =====================================================================
     win_size = dsp.get("slice_size", 45)
     shuffle_mode = dsp.get("shuffle_mode", "None")
-    
+
     if shuffle_mode != "None":
+        # All shuffle modes respect the same start/end window bounds.
+        w_start = int(np.clip(dsp.get("slice_start", 0), 0, working_traces.shape[1] - 1))
+        w_end = int(np.clip(dsp.get("slice_end", working_traces.shape[1]), w_start + 1, working_traces.shape[1]))
+
         if shuffle_mode == "Integrated-Sum (Global)":
-            # Use slice_start/slice_end as the energy window bounds.
-            # Default to the full trace so the UI spinbox values always take effect.
-            w_start = int(np.clip(dsp.get("slice_start", 0), 0, working_traces.shape[1] - 1))
-            w_end = int(np.clip(dsp.get("slice_end", working_traces.shape[1]), w_start + 1, working_traces.shape[1]))
             working_traces = np.sum(
                 np.abs(working_traces[:, w_start:w_end]),
                 axis=1,
@@ -1182,25 +1182,25 @@ def apply_dsp_pipeline(traces, dsp, full_traces=None):
             )
         elif shuffle_mode == "Sliding Window Integration (SWI)":
             working_traces = apply_sliding_window_integration(
-                working_traces, window_size=win_size
+                working_traces[:, w_start:w_end], window_size=win_size
             )
         elif shuffle_mode == "Window-Max Pooling":
             working_traces = apply_max_pooling(
-                working_traces, 0, working_traces.shape[1], win_size
+                working_traces, w_start, w_end, win_size
             )
         elif shuffle_mode == "Window-Sum Pooling":
             working_traces = apply_sum_pooling(
-                working_traces, 0, working_traces.shape[1], win_size
+                working_traces, w_start, w_end, win_size
             )
 
     # =====================================================================
     # 5. SURGICAL COMPRESSION / SLICING
     # Rule: Cut specific peaks out before PCA.
     # =====================================================================
-    if dsp.get("slice_enabled", False):
-        w_start = int(np.clip(dsp.get("slice_start", 1000), 0, working_traces.shape[1] - 1))
-        w_end = int(np.clip(dsp.get("slice_end", 4800), w_start + 1, working_traces.shape[1]))
-        
+    if dsp.get("slice_enabled", False) and working_traces.shape[1] > 1:
+        w_start = int(np.clip(dsp.get("slice_start", 0), 0, working_traces.shape[1] - 1))
+        w_end = int(np.clip(dsp.get("slice_end", working_traces.shape[1]), w_start + 1, working_traces.shape[1]))
+
         working_traces = apply_peak_slicing(
             working_traces,
             window_size=win_size,

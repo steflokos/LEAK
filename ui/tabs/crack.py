@@ -928,15 +928,25 @@ class CrackTab(QWidget):
         self.spin_esegs.setEnabled(elastic_active)
         self.spin_ewarp.setEnabled(elastic_active)
 
-        # 3. Jitter & Shared Window Size (Bundled Option)
-        # Read shuffle_mode first — Integrated-Sum also needs the start/end bounds
+        # 3. Jitter / Shuffling Defeat — read mode first, it governs several sub-controls
         shuffle_mode = self.combo_shuffle.currentText()
+        shuffle_active = shuffle_mode != "None"
         integrated_sum_active = shuffle_mode == "Integrated-Sum (Global)"
 
         # 2. Slicing Panel
+        # Start/End are shared bounds for ALL shuffle modes AND peak slicing.
+        # Peak Slicing is incompatible with Integrated-Sum (IS collapses to 1 sample first).
         slice_active = self.chk_slice.isChecked()
-        self.spin_sstart.setEnabled(slice_active or integrated_sum_active)
-        self.spin_send.setEnabled(slice_active or integrated_sum_active)
+        if integrated_sum_active:
+            self.chk_slice.setEnabled(False)
+            self.chk_slice.setChecked(False)
+            slice_active = False
+        else:
+            self.chk_slice.setEnabled(True)
+
+        bounds_active = slice_active or shuffle_active
+        self.spin_sstart.setEnabled(bounds_active)
+        self.spin_send.setEnabled(bounds_active)
         self.spin_sdist.setEnabled(slice_active)
         self.spin_sprom.setEnabled(slice_active)
         self.spin_scount.setEnabled(slice_active)
@@ -944,7 +954,7 @@ class CrackTab(QWidget):
         needs_window = slice_active or shuffle_mode in [
             "Sliding Window Integration (SWI)",
             "Window-Sum Pooling",
-            "Window-Max Pooling"
+            "Window-Max Pooling",
         ]
         self.spin_ssize.setEnabled(needs_window)
 
