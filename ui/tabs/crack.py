@@ -928,19 +928,22 @@ class CrackTab(QWidget):
         self.spin_esegs.setEnabled(elastic_active)
         self.spin_ewarp.setEnabled(elastic_active)
 
+        # 3. Jitter & Shared Window Size (Bundled Option)
+        # Read shuffle_mode first — Integrated-Sum also needs the start/end bounds
+        shuffle_mode = self.combo_shuffle.currentText()
+        integrated_sum_active = shuffle_mode == "Integrated-Sum (Global)"
+
         # 2. Slicing Panel
         slice_active = self.chk_slice.isChecked()
-        self.spin_sstart.setEnabled(slice_active)
-        self.spin_send.setEnabled(slice_active)
+        self.spin_sstart.setEnabled(slice_active or integrated_sum_active)
+        self.spin_send.setEnabled(slice_active or integrated_sum_active)
         self.spin_sdist.setEnabled(slice_active)
         self.spin_sprom.setEnabled(slice_active)
         self.spin_scount.setEnabled(slice_active)
 
-        # 3. Jitter & Shared Window Size (Bundled Option)
-        shuffle_mode = self.combo_shuffle.currentText()
         needs_window = slice_active or shuffle_mode in [
-            "Sliding Window Integration (SWI)", 
-            "Window-Sum Pooling", 
+            "Sliding Window Integration (SWI)",
+            "Window-Sum Pooling",
             "Window-Max Pooling"
         ]
         self.spin_ssize.setEnabled(needs_window)

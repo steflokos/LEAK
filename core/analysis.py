@@ -1171,9 +1171,10 @@ def apply_dsp_pipeline(traces, dsp, full_traces=None):
     
     if shuffle_mode != "None":
         if shuffle_mode == "Integrated-Sum (Global)":
-            # Safety checks for bounds
-            w_start = int(np.clip(dsp.get("slice_start", 1000), 0, working_traces.shape[1] - 1))
-            w_end = int(np.clip(dsp.get("slice_end", 4800), w_start + 1, working_traces.shape[1]))
+            # Use slice_start/slice_end as the energy window bounds.
+            # Default to the full trace so the UI spinbox values always take effect.
+            w_start = int(np.clip(dsp.get("slice_start", 0), 0, working_traces.shape[1] - 1))
+            w_end = int(np.clip(dsp.get("slice_end", working_traces.shape[1]), w_start + 1, working_traces.shape[1]))
             working_traces = np.sum(
                 np.abs(working_traces[:, w_start:w_end]),
                 axis=1,
