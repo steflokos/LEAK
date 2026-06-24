@@ -944,9 +944,9 @@ class CrackTab(QWidget):
         else:
             self.chk_slice.setEnabled(True)
 
-        bounds_active = slice_active or shuffle_active
-        self.spin_sstart.setEnabled(bounds_active)
-        self.spin_send.setEnabled(bounds_active)
+        # Start/End are always editable — they act as a pre-window for raw CPA too.
+        self.spin_sstart.setEnabled(True)
+        self.spin_send.setEnabled(True)
         self.spin_sdist.setEnabled(slice_active)
         self.spin_sprom.setEnabled(slice_active)
         self.spin_scount.setEnabled(slice_active)
