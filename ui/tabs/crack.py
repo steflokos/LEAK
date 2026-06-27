@@ -28,7 +28,6 @@ from PyQt6.QtCore import Qt
 
 import pyqtgraph as pg
 from ui.workers import AnalysisWorker, AutoSniperWorker
-from ui.workers import AnalysisWorker
 from core.analysis import (
     apply_dsp_pipeline,
     apply_gaussian_filter,
