@@ -566,6 +566,20 @@ class AES128_InvSBox_Out(LeakageModel):
         return AES128_InvSBox_Out.rsbox[pt_bytes ^ kguesses]
 
 
+class AES128_Combined_SBox_Out(LeakageModel):
+    name = "AES-128 Combined SBox+RSBox (Round 1 Shuffle Defeat)"
+    guess_space = 256
+    num_targets = 16
+
+    @staticmethod
+    def get_intermediate(pt_bytes, kguesses):
+        # Both real (sbox) and fake (rsbox) operations in the shuffled round use
+        # the same intermediate value (pt ^ k), so their combined HW is exploitable.
+        x = pt_bytes ^ kguesses
+        combined = AES128_SBox_Out.sbox[x].astype(np.uint16) + AES128_InvSBox_Out.rsbox[x].astype(np.uint16)
+        return (combined & 0xFF).astype(np.uint8)
+
+
 class Plaintext_XOR_Key(LeakageModel):
     name = "Plaintext XOR Key Input"
     guess_space = 256
@@ -609,10 +623,48 @@ class PRESENT_Nibble_SBox_Out(LeakageModel):
 
 LEAKAGE_MODELS = [
     AES128_SBox_Out,
+    AES128_InvSBox_Out,
+    AES128_Combined_SBox_Out,
     Plaintext_XOR_Key,
     PRESENT_Nibble_SBox_Out,
-    AES128_InvSBox_Out,
 ]
+
+# --- AES-128 KEY SCHEDULE UTILITIES ---
+
+def aes128_forward_key_schedule(k0_bytes):
+    """Derive the AES-128 round-10 key (16 bytes) from the original key k0."""
+    _sbox = AES128_SBox_Out.sbox
+    _rcon = np.array([0x00, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36], dtype=np.uint8)
+    W = np.zeros((44, 4), dtype=np.uint8)
+    k0 = np.array(list(k0_bytes), dtype=np.uint8)
+    for i in range(4):
+        W[i] = k0[i * 4 : (i + 1) * 4]
+    for i in range(4, 44):
+        temp = W[i - 1].copy()
+        if i % 4 == 0:
+            temp = _sbox[np.roll(temp, -1)]
+            temp[0] ^= _rcon[i // 4]
+        W[i] = W[i - 4] ^ temp
+    return W[40:44].flatten().tolist()
+
+
+def aes128_invert_key_schedule(k10_bytes):
+    """Recover the AES-128 round-0 key k0 from the round-10 key k10 (16 bytes)."""
+    _sbox = AES128_SBox_Out.sbox
+    _rcon = np.array([0x00, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36], dtype=np.uint8)
+    # Represent as 4 words: rk[0]=W[4r], rk[1]=W[4r+1], rk[2]=W[4r+2], rk[3]=W[4r+3]
+    rk = np.array(list(k10_bytes), dtype=np.uint8).reshape(4, 4)
+    for r in range(10, 0, -1):
+        A, B, C, D = rk[0].copy(), rk[1].copy(), rk[2].copy(), rk[3].copy()
+        # Invert:  W[4r-1]=D^C, W[4r-2]=C^B, W[4r-3]=B^A, W[4r-4]=A^SubWord(RotWord(W[4r-1]))^Rcon[r]
+        S = D ^ C
+        R = C ^ B
+        Q = B ^ A
+        P = A ^ _sbox[np.roll(S, -1)]
+        P[0] ^= _rcon[r]
+        rk = np.array([P, Q, R, S])
+    return rk.flatten().tolist()
+
 
 # --- DSP FILTERS & ALIGNMENT ENGINES ---
 
@@ -1061,6 +1113,19 @@ def apply_sliding_window_integration(traces, window_size=10):
     # FIX: Removed np.abs()
     return uniform_filter1d(traces, size=window_size, axis=1, mode="nearest") * window_size
 
+def apply_variance_poi(traces, top_k=200):
+    """Keep only the top-K highest-variance samples across all traces.
+
+    Variance is a keyless proxy for SNR: samples where the device leaks
+    information tend to have higher inter-trace variance than idle samples.
+    """
+    top_k = min(int(top_k), traces.shape[1])
+    if top_k <= 0:
+        return traces
+    variances = np.var(traces, axis=0)
+    poi_indices = np.argsort(variances)[-top_k:]
+    return traces[:, np.sort(poi_indices)]
+
 def compute_tvla(
     traces, pt_bytes, true_key_byte, leakage_model_class, fixed_vs_random_mask=None
 ):
@@ -1205,6 +1270,14 @@ def apply_dsp_pipeline(traces, dsp, full_traces=None):
             working_traces = apply_sum_pooling(
                 working_traces, w_start, w_end, win_size
             )
+
+    # =====================================================================
+    # 4.5. VARIANCE POI SELECTION
+    # Rule: Keep only the highest-variance samples before PCA/slicing.
+    #       Mutually exclusive with peak slicing (both reduce dimensionality).
+    # =====================================================================
+    if dsp.get("poi_enabled", False) and not dsp.get("slice_enabled", False):
+        working_traces = apply_variance_poi(working_traces, int(dsp.get("poi_topk", 200)))
 
     # =====================================================================
     # 5. SURGICAL COMPRESSION / SLICING

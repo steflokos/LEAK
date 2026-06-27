@@ -6,14 +6,8 @@ from PyQt6.QtCore import QThread, pyqtSignal
 
 from core.compiler import CompilerManager
 from core.analysis import (
-    AES128_SBox_Out, apply_gaussian_filter, apply_bandpass_filter, 
-    apply_max_pooling, apply_sum_pooling, apply_peak_alignment, apply_poc_alignment, apply_dtw_alignment,
-    apply_segment_alignment, apply_peak_slicing, apply_wavelet_denoising,
-    apply_pca_filtering, apply_fft_magnitude,
-    analyze_byte, compute_pge, compute_tvla, LEAKAGE_MODELS
-)
-from core.analysis import (
-    AES128_SBox_Out, apply_dsp_pipeline, analyze_byte, compute_pge, compute_tvla, LEAKAGE_MODELS
+    AES128_SBox_Out, apply_dsp_pipeline, analyze_byte, compute_pge, compute_tvla,
+    aes128_forward_key_schedule, LEAKAGE_MODELS,
 )
 
 class CompileWorker(QThread):
@@ -169,28 +163,35 @@ class AnalysisWorker(QThread):
         tvla_matrix = np.zeros((num_targets, num_samples), dtype=np.float64)
         completed = 0
         
-        # FIX 2: Dynamically route Data based on the model name
+        # Route input data: last-round model uses ciphertexts, all others use plaintexts
         use_ciphers = "Ciphertext" in model_name
         target_data = self.ciphers if (use_ciphers and self.ciphers is not None) else self.textins
-        
+
+        # For PGE/TVLA comparison, last-round model needs k10 (not k0) as the reference.
+        comparison_keys = None
+        if self.true_keys is not None:
+            k0 = self.true_keys if self.true_keys.ndim == 1 else self.true_keys[0]
+            if use_ciphers:
+                comparison_keys = np.array(aes128_forward_key_schedule(k0.tolist()), dtype=np.uint8)
+            else:
+                comparison_keys = k0
+
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.num_threads) as executor:
             futures = {
-                # FIX 3: Pass target_data instead of self.textins
-                executor.submit(analyze_byte, b, working_traces, target_data[:, b], leakage_model_class): b 
+                executor.submit(analyze_byte, b, working_traces, target_data[:, b], leakage_model_class): b
                 for b in range(num_targets)
             }
-            
+
             for future in concurrent.futures.as_completed(futures):
                 bnum, best_guess, byte_corr = future.result()
                 recovered_key[bnum] = best_guess
                 all_correlations[bnum] = byte_corr
-                
-                if self.true_keys is not None:
-                    t_key_byte = int(self.true_keys[bnum] if self.true_keys.ndim == 1 else self.true_keys[0, bnum])
+
+                if comparison_keys is not None:
+                    t_key_byte = int(comparison_keys[bnum])
                     pge_list[bnum] = compute_pge(byte_corr, t_key_byte)
-                    # FIX 4: Update TVLA to also use the correct target_data
                     tvla_matrix[bnum] = compute_tvla(working_traces, target_data[:, bnum], t_key_byte, leakage_model_class)
-                
+
                 completed += 1
                 self.progress_signal.emit(completed, num_targets)
 
@@ -233,6 +234,16 @@ class AutoSniperWorker(QThread):
         total_combos = len(combinations)
         use_ciphers = "Ciphertext" in model_name
         target_data = self.ciphers if (use_ciphers and self.ciphers is not None) else self.textins
+
+        # Derive comparison keys: last-round model needs k10 for PGE evaluation
+        comparison_keys = None
+        if self.true_keys is not None:
+            k0 = self.true_keys if self.true_keys.ndim == 1 else self.true_keys[0]
+            if use_ciphers:
+                comparison_keys = np.array(aes128_forward_key_schedule(k0.tolist()), dtype=np.uint8)
+            else:
+                comparison_keys = k0
+
         for i, combo in enumerate(combinations):
             combo_str = ", ".join([f"{k}={v}" for k, v in combo.items() if len(self.sniper_config[k]) > 1])
             if not combo_str: combo_str = "Fixed Baseline parameters"
@@ -251,8 +262,8 @@ class AutoSniperWorker(QThread):
                 max_corr_per_guess = np.max(byte_corr, axis=1)
                 sorted_guesses = np.argsort(max_corr_per_guess)[::-1]
                 
-                if self.true_keys is not None:
-                    t_key = int(self.true_keys[b] if self.true_keys.ndim == 1 else self.true_keys[0, b])
+                if comparison_keys is not None:
+                    t_key = int(comparison_keys[b])
                     metric = int(np.where(sorted_guesses == t_key)[0][0])
                 else:
                     metric = -float(max_corr_per_guess[sorted_guesses[0]])

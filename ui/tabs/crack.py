@@ -43,6 +43,8 @@ from core.analysis import (
     apply_dtw_alignment,
     apply_pca_filtering,
     apply_fft_magnitude,
+    apply_variance_poi,
+    aes128_invert_key_schedule,
     LEAKAGE_MODELS,
 )
 
@@ -493,6 +495,22 @@ class SniperSettingsDialog(QDialog):
                         "step": 100,
                     },
                 ),
+                (
+                    "poi_enabled",
+                    "Enable Variance POI",
+                    {"type": bool, "options": [True, False], "default": base_dsp.get("poi_enabled", False)},
+                ),
+                (
+                    "poi_topk",
+                    "POI Top-K Samples",
+                    {
+                        "type": int,
+                        "min": 10,
+                        "max": 5000,
+                        "default": base_dsp.get("poi_topk", 200),
+                        "step": 50,
+                    },
+                ),
             ],
         }
 
@@ -839,6 +857,20 @@ class CrackTab(QWidget):
         h8.addWidget(QLabel("Max Bins:"))
         h8.addWidget(self.spin_fft_cutoff)
         filters_lay.addLayout(h8)
+
+        self.chk_poi = QCheckBox("Enable Variance POI Selection")
+        self.chk_poi.stateChanged.connect(self.update_trace_plot)
+        self.spin_poi_k = QSpinBox()
+        self.spin_poi_k.setRange(10, 5000)
+        self.spin_poi_k.setValue(200)
+        self.spin_poi_k.setToolTip("Number of highest-variance samples to keep (mutually exclusive with Peak Slicing)")
+        self.spin_poi_k.valueChanged.connect(self.update_trace_plot)
+        h_poi = QHBoxLayout()
+        h_poi.addWidget(self.chk_poi)
+        h_poi.addWidget(QLabel("Top-K:"))
+        h_poi.addWidget(self.spin_poi_k)
+        filters_lay.addLayout(h_poi)
+
         filters_box.setLayout(filters_lay)
         dsp_master_layout.addWidget(filters_box)
 
@@ -912,6 +944,7 @@ class CrackTab(QWidget):
         self.chk_gauss.stateChanged.connect(on_feature_toggled)
         self.chk_pca.stateChanged.connect(on_feature_toggled)
         self.chk_fft.stateChanged.connect(on_feature_toggled)
+        self.chk_poi.stateChanged.connect(on_feature_toggled)
 
         # Run it once at startup to initialize the grey-outs
         self.update_ui_states()
@@ -974,6 +1007,15 @@ class CrackTab(QWidget):
         self.spin_fft_start.setEnabled(fft_active)
         self.spin_fft_end.setEnabled(fft_active)
         self.spin_fft_cutoff.setEnabled(fft_active)
+
+        poi_active = self.chk_poi.isChecked()
+        self.spin_poi_k.setEnabled(poi_active)
+        # POI and peak slicing compete; grey out POI when slicing is active
+        if slice_active and poi_active:
+            self.chk_poi.setEnabled(False)
+            self.chk_poi.setChecked(False)
+        else:
+            self.chk_poi.setEnabled(True)
     def on_leakage_model_changed(self, model_name):
         model_class = self.leakage_models_map.get(model_name)
         if model_class:
@@ -1021,8 +1063,9 @@ class CrackTab(QWidget):
             ),
             "pca_enabled": self.chk_pca.isChecked(),
             "pca_comps": self.spin_pca.value(),
-            "masking_mode": self.combo_masking.currentText()
-            # BUG FIX: Removed the duplicated shuffle_mode key that was overriding variables
+            "masking_mode": self.combo_masking.currentText(),
+            "poi_enabled": self.chk_poi.isChecked(),
+            "poi_topk": self.spin_poi_k.value(),
         }
 
     def update_trace_plot(self):
@@ -1139,6 +1182,13 @@ class CrackTab(QWidget):
         num_targets = model_cls.num_targets if model_cls else 16
         self.progress_bar.setValue(num_targets)
 
+        # Last-round model recovers k10; invert to k0 before display/comparison
+        if model_cls and "Ciphertext" in model_cls.name:
+            try:
+                recovered_key = aes128_invert_key_schedule(recovered_key)
+            except Exception:
+                pass
+
         self.recovered_key = recovered_key
         self.correlations = all_correlations
         self.pge_list = pge_list
@@ -1254,9 +1304,17 @@ class CrackTab(QWidget):
         self.btn_load.setEnabled(True)
 
         self.probability_matrix = probability_matrix
-        self.best_corrs = best_corrs  # FIX: Store it in class scope
+        self.best_corrs = best_corrs
         model_cls = self.leakage_models_map.get(self.combo_model.currentText())
         num_targets = model_cls.num_targets if model_cls else 16
+        self._sniper_model_is_last_round = model_cls and "Ciphertext" in model_cls.name
+
+        # Last-round model recovers k10; invert to k0 before display/comparison
+        if self._sniper_model_is_last_round:
+            try:
+                recovered_key = list(aes128_invert_key_schedule(recovered_key))
+            except Exception:
+                pass
 
         self.recovered_key = recovered_key
         self.pge_list = best_pges
@@ -1356,16 +1414,26 @@ class CrackTab(QWidget):
 
         # Verification Block
         self.lbl_key.setText(f"Verifying {len(active_beam)} full candidates against ciphertext...")
-        
+
+        is_last_round = getattr(self, "_sniper_model_is_last_round", False)
         found_key = None
         for _, candidate_key_list in active_beam:
-            candidate_key_bytes = bytes(candidate_key_list)
-            
+            if is_last_round:
+                # Beam was built in k10 space; invert to k0 for AES verification
+                try:
+                    k0_list = aes128_invert_key_schedule(candidate_key_list)
+                    candidate_key_bytes = bytes(k0_list)
+                except Exception:
+                    continue
+            else:
+                candidate_key_bytes = bytes(candidate_key_list)
+                k0_list = candidate_key_list
+
             cipher = AES.new(candidate_key_bytes, AES.MODE_ECB)
             test_ciphertext = cipher.encrypt(sample_plaintext)
-            
+
             if test_ciphertext == target_ciphertext:
-                found_key = candidate_key_list
+                found_key = list(candidate_key_bytes)  # always k0
                 break
 
         if found_key is not None:
