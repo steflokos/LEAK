@@ -591,6 +591,16 @@ class CrackTab(QWidget):
         self.spin_threads.setRange(1, 32)
         self.spin_threads.setValue(os.cpu_count() or 4)
 
+        lbl_batches = QLabel("Batches:")
+        self.spin_batches = QSpinBox()
+        self.spin_batches.setRange(1, 1000)
+        self.spin_batches.setValue(1)
+        self.spin_batches.setToolTip(
+            "Split traces into N batches for DSP processing.\n"
+            "Each batch is processed independently then combined.\n"
+            "Reduces peak memory: 100K traces / 10 batches = 10K per batch."
+        )
+
         self.btn_crack = QPushButton("Execute SCA Verification")
         self.btn_crack.clicked.connect(self.start_cpa)
         self.btn_crack.setEnabled(False)
@@ -612,6 +622,9 @@ class CrackTab(QWidget):
         top_layout.addSpacing(10)
         top_layout.addWidget(lbl_threads)
         top_layout.addWidget(self.spin_threads)
+        top_layout.addSpacing(10)
+        top_layout.addWidget(lbl_batches)
+        top_layout.addWidget(self.spin_batches)
         top_layout.addStretch()
         top_layout.addWidget(self.btn_sniper)  # <-- Added Sniper Button
         top_layout.addWidget(self.btn_crack)
@@ -1162,9 +1175,11 @@ class CrackTab(QWidget):
 
         dsp_settings = self.get_current_dsp_dictionary()
         threads = self.spin_threads.value()
+        batches = self.spin_batches.value()
 
         self.worker = AnalysisWorker(
-            self.traces, self.textins, self.ciphers, dsp_settings, threads, true_keys=self.keys
+            self.traces, self.textins, self.ciphers, dsp_settings, threads,
+            true_keys=self.keys, batch_count=batches
         )
         self.worker.progress_signal.connect(self.update_progress)
         self.worker.finished_signal.connect(self.on_cpa_finished)

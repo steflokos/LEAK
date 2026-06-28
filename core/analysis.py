@@ -1054,9 +1054,11 @@ def shift_trace_safe(trace, shift_val):
 
 def analyze_byte(bnum, traces, pt_byte_column, leakage_model_class):
     """Robust Vectorized Target Leakage Engine using explicit shape enforcement."""
+    traces = np.asarray(traces, dtype=np.float32)
     t_bar = np.mean(traces, axis=0)
-    t_dev = traces - t_bar
-    sum_sq_t = np.sum(t_dev**2, axis=0)
+    t_dev = traces - t_bar  # (N, S) float32
+    # einsum avoids materializing the (N, S) squared temporary array
+    sum_sq_t = np.einsum('ij,ij->j', t_dev, t_dev)
 
     space = leakage_model_class.guess_space
 
@@ -1069,14 +1071,15 @@ def analyze_byte(bnum, traces, pt_byte_column, leakage_model_class):
     )
 
     HW = get_hw_reference(space)
-    hw_guesses = HW[intermediate].astype(np.float64)  # Shape: (N, Guess Space)
+    # float32 keeps dot product in float32 (avoids numpy upcasting t_dev to float64)
+    hw_guesses = HW[intermediate].astype(np.float32)  # Shape: (N, Guess Space)
 
     # Correlate properly matching the Trace Axis (axis=0)
     h_bar = np.mean(hw_guesses, axis=0, keepdims=True)
     h_dev = hw_guesses - h_bar
     sum_sq_h = np.sum(h_dev**2, axis=0)
 
-    sum_prod = np.dot(h_dev.T, t_dev)
+    sum_prod = np.dot(h_dev.T, t_dev)  # (256, N) @ (N, S) → float32, no upcast
 
     # Epsilon prevents nan collapse when var approaches exact zero
     denominator = np.sqrt(sum_sq_h[:, None] * sum_sq_t[None, :])
@@ -1244,11 +1247,9 @@ def apply_dsp_pipeline(traces, dsp, full_traces=None):
         w_end = int(np.clip(dsp.get("slice_end", working_traces.shape[1]), w_start + 1, working_traces.shape[1]))
 
         if shuffle_mode == "Integrated-Sum (Global)":
-            working_traces = np.sum(
-                np.abs(working_traces[:, w_start:w_end]),
-                axis=1,
-                keepdims=True,
-            )
+            zone = working_traces[:, w_start:w_end]
+            np.abs(zone, out=zone)  # in-place: no copy of the (N, S) array
+            working_traces = np.sum(zone, axis=1, keepdims=True)
         elif shuffle_mode == "Sliding Window Integration (SWI)":
             working_traces = apply_sliding_window_integration(
                 working_traces[:, w_start:w_end], window_size=win_size

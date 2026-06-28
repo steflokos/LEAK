@@ -138,7 +138,7 @@ class AnalysisWorker(QThread):
     finished_signal = pyqtSignal(list, object, list, object)  
 
     # FIX 1: Add 'ciphers' to the arguments
-    def __init__(self, traces, textins, ciphers, dsp_settings, num_threads=None, true_keys=None):
+    def __init__(self, traces, textins, ciphers, dsp_settings, num_threads=None, true_keys=None, batch_count=1):
         super().__init__()
         self.traces = traces
         self.textins = textins
@@ -146,9 +146,23 @@ class AnalysisWorker(QThread):
         self.dsp = dsp_settings
         self.num_threads = num_threads
         self.true_keys = true_keys
+        self.batch_count = max(1, int(batch_count))
 
     def run(self):
-        working_traces = apply_dsp_pipeline(self.traces, self.dsp)
+        n = len(self.traces)
+        if self.batch_count > 1:
+            batch_size = (n + self.batch_count - 1) // self.batch_count
+            processed = []
+            for i in range(self.batch_count):
+                start = i * batch_size
+                end = min(start + batch_size, n)
+                if start >= n:
+                    break
+                processed.append(apply_dsp_pipeline(self.traces[start:end], self.dsp))
+                self.progress_signal.emit(i + 1, self.batch_count)
+            working_traces = np.concatenate(processed, axis=0)
+        else:
+            working_traces = apply_dsp_pipeline(self.traces, self.dsp)
 
         model_name = self.dsp.get('leakage_model', "AES-128 S-Box Output (Round 1)")
         leakage_model_class = next((m for m in LEAKAGE_MODELS if m.name == model_name), AES128_SBox_Out)
@@ -176,7 +190,13 @@ class AnalysisWorker(QThread):
             else:
                 comparison_keys = k0
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=self.num_threads) as executor:
+        # Cap concurrent threads so simultaneous t_dev allocations don't OOM.
+        # Each thread allocates t_dev ≈ working_traces.nbytes; budget ~20 GB headroom.
+        trace_gb = working_traces.nbytes / (1024 ** 3)
+        safe_max = max(1, int(20 / max(trace_gb, 0.001)))
+        effective_threads = min(self.num_threads or 16, safe_max)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=effective_threads) as executor:
             futures = {
                 executor.submit(analyze_byte, b, working_traces, target_data[:, b], leakage_model_class): b
                 for b in range(num_targets)
