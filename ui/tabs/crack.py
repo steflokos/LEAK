@@ -309,7 +309,7 @@ class SniperSettingsDialog(QDialog):
                         "type": int,
                         "min": 0,
                         "max": 1000000,
-                        "default": base_dsp.get("slice_start", 1150),
+                        "default": base_dsp.get("slice_start", 0),
                         "step": 100,
                     },
                 ),
@@ -320,7 +320,7 @@ class SniperSettingsDialog(QDialog):
                         "type": int,
                         "min": 10,
                         "max": 1000000,
-                        "default": base_dsp.get("slice_end", 4800),
+                        "default": base_dsp.get("slice_end", 5000),
                         "step": 100,
                     },
                 ),
@@ -742,14 +742,14 @@ class CrackTab(QWidget):
         lay_slice_bounds.addWidget(QLabel("Start:"))
         self.spin_sstart = QSpinBox()
         self.spin_sstart.setRange(0, 1000000)
-        self.spin_sstart.setValue(1150)
+        self.spin_sstart.setValue(0)
         self.spin_sstart.valueChanged.connect(self.update_trace_plot)
         lay_slice_bounds.addWidget(self.spin_sstart)
 
         lay_slice_bounds.addWidget(QLabel("End:"))
         self.spin_send = QSpinBox()
         self.spin_send.setRange(10, 1000000)
-        self.spin_send.setValue(4800)
+        self.spin_send.setValue(5000)
         self.spin_send.valueChanged.connect(self.update_trace_plot)
         lay_slice_bounds.addWidget(self.spin_send)
         countermeasure_lay.addLayout(lay_slice_bounds)
