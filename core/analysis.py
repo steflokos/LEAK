@@ -1172,20 +1172,11 @@ def compute_pge(byte_correlations, true_key_byte):
 
 
 def apply_dsp_pipeline(traces, dsp, full_traces=None):
-    working_traces = traces.copy()
-
-    # =====================================================================
-    # 0. PRE-WINDOW (applies in all modes, including raw CPA)
-    # Crop the trace to [slice_start, slice_end] before any processing.
-    # Only active when the user has explicitly narrowed the window
-    # (i.e. start > 0 or end < trace length).
-    # =====================================================================
-    pre_start = int(dsp.get("slice_start", 0))
-    pre_end   = int(dsp.get("slice_end",   working_traces.shape[1]))
-    if pre_start > 0 or pre_end < working_traces.shape[1]:
-        pre_start = int(np.clip(pre_start, 0, working_traces.shape[1] - 1))
-        pre_end   = int(np.clip(pre_end,   pre_start + 1, working_traces.shape[1]))
-        working_traces = working_traces[:, pre_start:pre_end]
+    # Slice the window BEFORE copying so a narrow window avoids allocating
+    # the full trace array (critical for large datasets like 100K×25K).
+    pre_start = int(np.clip(int(dsp.get("slice_start", 0)), 0, traces.shape[1] - 1))
+    pre_end   = int(np.clip(int(dsp.get("slice_end", traces.shape[1])), pre_start + 1, traces.shape[1]))
+    working_traces = np.array(traces[:, pre_start:pre_end], dtype=np.float32)
 
     # =====================================================================
     # 1. CONTINUOUS FILTERS (Signal Conditioning)

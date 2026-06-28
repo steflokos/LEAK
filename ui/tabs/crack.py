@@ -1119,7 +1119,7 @@ class CrackTab(QWidget):
 
         try:
             self.lbl_key.setText("Loading arrays into host memory space...")
-            self.traces = np.load(file_traces)
+            self.traces = np.load(file_traces, mmap_mode='r')
             self.textins = np.load(file_textins)
             self.keys = np.load(file_keys)
             
